@@ -1,22 +1,92 @@
-# cv.py — Cribado de Candidatos (CSV o PDF) en Streamlit
+# cv.py — Cribado de Candidatos (CSV o PDF) orientado a CLOSERS
+# --------------------------------------------------------------
 # - Sube varios archivos (mezclados CSV/PDF)
-# - Extrae texto de PDFs (fichas) y calcula una PUNTUACIÓN DE IDONEIDAD
-# - Señales: venta telefónica/telemarketing, fidelización, cierres, estabilidad laboral
-# - Penaliza rotación (empleos muy cortos), premia puestos ≥12 meses
-# - Ordena/filtra por puntuación y permite descargar CSV
+# - Extrae texto de PDFs y calcula una PUNTUACIÓN DE IDONEIDAD
+# - Pesa fuerte: cierre, negociación, objeciones, KPIs, venta consultiva, pipeline, B2B, CRM
+# - Penaliza: teleoperación/call center, rotación corta (<3m)
+# - Bonifica estabilidad razonable (≥12m) sin sobrepremiar estancamiento
+# - Ordena/filtra por puntuación y descarga CSV con el resultado
 
-import io, os, re, csv
-import chardet, pdfplumber, pandas as pd, streamlit as st
+import io, os, re
+import chardet
+import pdfplumber
+import pandas as pd
+import streamlit as st
 
 st.set_page_config(page_title="Cribado de Candidatos", layout="wide")
-st.title("🎯 Cribado de Candidatos (CSV o PDF)")
+st.title("🎯 Cribador de CLOSERS (CSV o PDF)")
 
-# -----------------------------
-# Utilidades CSV
-# -----------------------------
+# =========================
+# Config de scoring CLOSER
+# =========================
+
+CLOSER_KEYWORDS = {
+    # Cierre / negociación (fuerte)
+    "cierre de ventas": 4,
+    "cerrador": 4,
+    "técnicas de cierre": 4,
+    "tecnicas de cierre": 4,
+    "negociación": 4,
+    "negociacion": 4,
+    "objeciones": 4,
+    "venta consultiva": 4,
+    "venta de alto valor": 4,
+    "venta b2b": 4,
+    "pipeline": 4,
+    "pipeline comercial": 4,
+    "prospección": 3,
+    "prospectacion": 3,
+
+    # Rendimiento / métricas / dirección comercial
+    "kpi": 3,
+    "objetivos": 3,
+    "cuotas": 3,
+    "superar metas": 3,
+    "cumplimiento de objetivos": 3,
+    "top ventas": 3,
+    "mejor vendedor": 3,
+    "ranking": 3,
+    "crm": 3,
+    "venta directa": 3,
+    "venta cruzada": 3,
+    "venta recurrente": 3,
+
+    # Fidelización & retención (útiles, pero menos que cierre puro)
+    "fidelización": 2,
+    "fidelizacion": 2,
+    "retención": 2,
+    "retencion": 2,
+}
+
+# Señales a penalizar (perfil no-closer)
+NON_CLOSER_HINTS = {
+    "teleoperador": -3,
+    "teleoperadora": -3,
+    "telemarketing": -3,     # si en tu negocio hay buen telemarketing, bájalo a -1
+    "call center": -3,
+    "atención al cliente": -2,
+    "atencion al cliente": -2,
+}
+
+# Campos típicos de InfoJobs (pueden no estar)
+INFOJOBS_TEXT_FIELDS = [
+    "skills", "competencias", "conocimientos", "habilidades",
+    "experiencia", "experiences", "funciones", "resumen", "descripcion",
+    "puestos", "tareas", "logros", "otros_datos",
+]
+
+# Patrones de duración estilo InfoJobs
+RE_YEARS = re.compile(r"(\d+)\s*años?", re.IGNORECASE)
+RE_MONTHS = re.compile(r"(\d+)\s*meses?", re.IGNORECASE)
+RE_DUR_PARENS = re.compile(r"\(([^)]*años?[^)]*|[^)]*meses?)\)")  # capturar “(1 año y 5 meses)”, etc.
+
+# ============
+# CSV helpers
+# ============
+
 def detectar_encoding_y_delimitador(file_bytes: bytes):
     enc = chardet.detect(file_bytes or b"").get("encoding", "utf-8")
-    sample = file_bytes[:15000]
+    sample = file_bytes[:20000]
     text = sample.decode(enc, errors="ignore")
     if text.count(";") > text.count(",") and text.count(";") > text.count("\t"):
         delim = ";"
@@ -26,121 +96,179 @@ def detectar_encoding_y_delimitador(file_bytes: bytes):
         delim = ","
     return enc, delim
 
-def leer_csv(uploaded_file):
+def leer_csv(uploaded_file) -> pd.DataFrame:
     raw = uploaded_file.read()
     enc, delim = detectar_encoding_y_delimitador(raw)
-    df = pd.read_csv(io.StringIO(raw.decode(enc, errors="replace")), sep=delim)
+    df = pd.read_csv(io.StringIO(raw.decode(enc, errors="replace")), sep=delim, engine="python")
     df["_fuente_archivo"] = uploaded_file.name
     return df
 
-# -----------------------------
-# Utilidades PDF → texto/filas
-# -----------------------------
+# ============
+# PDF helpers
+# ============
+
 def pdf_a_texto(uploaded_file) -> str:
     with pdfplumber.open(uploaded_file) as pdf:
         return "\n".join(page.extract_text() or "" for page in pdf.pages)
 
-_nombre_regex = re.compile(r"^[A-ZÁÉÍÓÚÑ][^\n\r]+", re.MULTILINE)
-_duracion_parentesis = re.compile(r"\(([^\)]*?años?[^\)]*?|[^\)]*?meses?)\)")
-_duracion_aym = re.compile(r"(?:(\d+)\s*años?)?(?:\s*y\s*)?(\d+)\s*meses?", re.IGNORECASE)
-_duracion_meses = re.compile(r"(\d+)\s*meses?", re.IGNORECASE)
-
-PALABRAS_FUERZA = [
-    "telemarketing", "venta telefónica", "venta telefonica",
-    "fidelización", "fidelizacion", "captación", "captacion",
-    "cierre de ventas", "orientación a resultados", "orientacion a resultados",
-    "call center", "recuperación de clientes", "retención",
-    "asesoría energética", "atención telefónica",
-]
-
 def extraer_nombre(texto: str) -> str:
-    m = _nombre_regex.search(texto.strip())
-    if m:
-        nombre = m.group(0).strip()
-        if "@" not in nombre and not any(x.isdigit() for x in nombre):
-            return nombre
-        return nombre
+    # Toma la primera línea “tipo nombre” (heurístico)
+    for line in (texto or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "@" in line or any(ch.isdigit() for ch in line):
+            continue
+        return line
     return "(sin nombre)"
 
-def estimar_meses_trabajados(texto: str):
-    """Devuelve (meses_totales, puestos_estables(>=12m), puestos_muy_cortos(<3m))."""
-    meses_totales = estables = muy_cortos = 0
-    for m in _duracion_parentesis.finditer(texto):
-        frag = m.group(1)
-        mm = _duracion_aym.search(frag)
-        if mm:
-            años = int(mm.group(1) or 0)
-            meses = int(mm.group(2) or 0)
-            tot = años * 12 + meses
-        else:
-            mm2 = _duracion_meses.search(frag)
-            tot = int(mm2.group(1)) if mm2 else 0
-        meses_totales += tot
-        if tot >= 12: estables += 1
-        if 0 < tot < 3: muy_cortos += 1
+# =====================
+# Scoring & agregación
+# =====================
+
+def _meses_estimados(texto: str) -> tuple[int, int, int]:
+    """
+    Devuelve (meses_totales, puestos_estables(>=12m), puestos_muy_cortos(<3m))
+    a partir del texto libre. Heurístico robusto para InfoJobs.
+    """
+    t = (texto or "").lower()
+    meses_totales = 0
+    estables = 0
+    muy_cortos = 0
+
+    # Suma todas las duraciones que encuentre (años y meses)
+    for m in RE_YEARS.finditer(t):
+        meses_totales += int(m.group(1)) * 12
+    for m in RE_MONTHS.finditer(t):
+        meses_totales += int(m.group(1))
+
+    # Estabilidad / muy cortos (heurístico básico)
+    if re.search(r"(\b1\s*año\b|\b12\s*meses\b)", t):
+        estables += 1
+    if re.search(r"\b(1|2)\s*mes(es)?\b", t):
+        muy_cortos += 1
+
+    # Plus: si encontramos varios paréntesis con duraciones, contamos estables/cortos por bloque
+    for blk in RE_DUR_PARENS.findall(t):
+        y = RE_YEARS.search(blk)
+        m = RE_MONTHS.search(blk)
+        total_blk = (int(y.group(1))*12 if y else 0) + (int(m.group(1)) if m else 0)
+        if total_blk >= 12:
+            estables += 1
+        elif 0 < total_blk < 3:
+            muy_cortos += 1
+
     return meses_totales, estables, muy_cortos
 
-def score_desde_texto(texto: str) -> dict:
-    t = texto.lower()
-    score, hits = 0, []
-    for p in PALABRAS_FUERZA:
-        if p in t:
-            score += 3
-            hits.append(p)
-    meses_totales, estables, muy_cortos = estimar_meses_trabajados(texto)
-    score += estables * 2        # premiar empleos largos
-    score -= muy_cortos * 2      # penalizar cambios breves
-    if "fidelización" in t or "fidelizacion" in t: score += 2
-    if "orientación a resultados" in t or "orientacion a resultados" in t: score += 2
+def _score_texto_closer(txt: str) -> dict:
+    """
+    Scoring orientado a closers:
+    +4/+3 por señales de cierre/negociación/KPI
+    penaliza roles de teleoperación
+    bonifica estabilidad >=12m y penaliza <3m
+    pequeño bonus por números (%/€/cifras) como indicio de KPIs
+    """
+    t = (txt or "").lower()
+    score = 0
+    hits = []
+
+    # keywords pro-closer
+    for k, w in CLOSER_KEYWORDS.items():
+        if k in t:
+            score += w
+            hits.append(k)
+
+    # penalizaciones
+    for k, w in NON_CLOSER_HINTS.items():
+        if k in t:
+            score += w
+            hits.append(f"-{k}")
+
+    # estabilidad/rotación
+    meses_totales, estables, muy_cortos = _meses_estimados(t)
+    score += estables * 2
+    score -= muy_cortos * 2
+
+    # señales numéricas (posibles KPIs: %, €, cifras)
+    if re.search(r"\d+\s*%|€|eur|euros|\b\d{2,}\b", t):
+        score += 1
+
     return {
         "score": score,
-        "hits": ", ".join(sorted(set(hits))) or "",
+        "hits": ", ".join(sorted(set(hits))) if hits else "",
         "meses_totales": meses_totales,
         "puestos_estables": estables,
         "puestos_muy_cortos": muy_cortos,
     }
 
+def texto_candidato(row: pd.Series) -> str:
+    """
+    Construye un texto robusto a partir de las columnas disponibles (InfoJobs es irregular).
+    Si no hay columnas ricas, concatena toda la fila.
+    """
+    trozos = []
+    for col in INFOJOBS_TEXT_FIELDS:
+        if col in row and pd.notna(row[col]):
+            trozos.append(str(row[col]))
+    if not trozos:
+        trozos = [" ".join([str(v) for v in row.astype(str).values])]
+    return " \n ".join(trozos)
+
+def calcular_puntuacion_df_textos(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aplica _score_texto_closer sobre un DataFrame que puede venir de CSV o construirse desde PDF.
+    Si existe columna '_texto', la usa; si no, compone texto desde columnas típicas de InfoJobs.
+    """
+    df = df.copy()
+    if "_texto" in df.columns:
+        textos = df["_texto"].astype(str)
+    else:
+        textos = df.apply(texto_candidato, axis=1)
+
+    metrics = textos.apply(_score_texto_closer)
+    df["Puntuación"] = [m["score"] for m in metrics]
+    df["matches"] = [m["hits"] for m in metrics]
+    df["meses_totales"] = [m["meses_totales"] for m in metrics]
+    df["puestos_estables(>=12m)"] = [m["puestos_estables"] for m in metrics]
+    df["puestos_muy_cortos(<3m)"] = [m["puestos_muy_cortos"] for m in metrics]
+    return df
+
 def pdf_a_fila(uploaded_file) -> pd.DataFrame:
     texto = pdf_a_texto(uploaded_file)
     nombre = extraer_nombre(texto)
-    m = score_desde_texto(texto)
+    metrics = _score_texto_closer(texto)
     return pd.DataFrame([{
         "nombre": nombre,
-        "Puntuación": m["score"],
-        "matches": m["hits"],
-        "meses_totales": m["meses_totales"],
-        "puestos_estables(>=12m)": m["puestos_estables"],
-        "puestos_muy_cortos(<3m)": m["puestos_muy_cortos"],
+        "_texto": texto[:4000],  # preview limitado
+        "Puntuación": metrics["score"],
+        "matches": metrics["hits"],
+        "meses_totales": metrics["meses_totales"],
+        "puestos_estables(>=12m)": metrics["puestos_estables"],
+        "puestos_muy_cortos(<3m)": metrics["puestos_muy_cortos"],
         "_fuente_archivo": uploaded_file.name,
-        "_texto": texto[:2000],
     }])
 
-# -----------------------------
-# Lector genérico (CSV o PDF)
-# -----------------------------
-st.sidebar.header("📂 Subida de archivos")
-archivos = st.sidebar.file_uploader("Sube CSV y/o PDF de candidatos", type=["csv", "pdf"], accept_multiple_files=True)
-if not archivos:
+# ==========================
+# UI: carga y procesamiento
+# ==========================
+
+with st.sidebar:
+    st.header("📂 Subida de archivos")
+    files = st.file_uploader("Sube CSV y/o PDF de candidatos", type=["csv", "pdf"], accept_multiple_files=True)
+    st.caption("Puedes mezclar CSV y PDF en la misma carga.")
+
+if not files:
     st.info("Sube tus archivos para comenzar el cribado.")
     st.stop()
 
 filas = []
-for f in archivos:
+for f in files:
     ext = os.path.splitext(f.name)[1].lower()
     try:
         if ext == ".csv":
-            df = leer_csv(f)
-            if "_texto" not in df.columns:
-                df_text = df.astype(str).apply(lambda r: " ".join(r.values), axis=1)
-            else:
-                df_text = df["_texto"].astype(str)
-            scores = df_text.apply(score_desde_texto)
-            df["Puntuación"] = [s["score"] for s in scores]
-            df["matches"] = [s["hits"] for s in scores]
-            df["meses_totales"] = [s["meses_totales"] for s in scores]
-            df["puestos_estables(>=12m)"] = [s["puestos_estables"] for s in scores]
-            df["puestos_muy_cortos(<3m)"] = [s["puestos_muy_cortos"] for s in scores]
-            filas.append(df)
+            df_csv = leer_csv(f)
+            df_scored = calcular_puntuacion_df_textos(df_csv)
+            filas.append(df_scored)
         elif ext == ".pdf":
             filas.append(pdf_a_fila(f))
         else:
@@ -153,25 +281,35 @@ if not filas:
     st.stop()
 
 resultado = pd.concat(filas, ignore_index=True, sort=False)
+
 st.success(f"✅ {len(resultado)} candidatos procesados")
 
-# Controles
-min_score = int(resultado["Puntuación"].min()) if "Puntuación" in resultado else 0
-max_score = int(resultado["Puntuación"].max()) if "Puntuación" in resultado else 0
-valor_def = min(min_score + 5, max_score) if max_score > min_score else min_score
-umbral = st.sidebar.slider("Puntuación mínima", min_value=min_score, max_value=max_score if max_score>min_score else min_score+1, value=valor_def)
+# ============
+# Controles UI
+# ============
+min_s = int(resultado["Puntuación"].min()) if "Puntuación" in resultado else 0
+max_s = int(resultado["Puntuación"].max()) if "Puntuación" in resultado else 0
+def_val = min(min_s + 5, max_s) if max_s > min_s else min_s
 
-orden = st.sidebar.selectbox("Ordenar por", options=["Puntuación", "meses_totales", "puestos_estables(>=12m)", "puestos_muy_cortos(<3m)", "nombre"], index=0)
-asc = st.sidebar.checkbox("Ascendente", value=False)
+with st.sidebar:
+    umbral = st.slider("Puntuación mínima", min_value=min_s, max_value=max_s if max_s > min_s else min_s+1, value=def_val)
+    ordenar_por = st.selectbox("Ordenar por", options=[
+        "Puntuación", "meses_totales", "puestos_estables(>=12m)", "puestos_muy_cortos(<3m)", "nombre"
+    ], index=0)
+    asc = st.checkbox("Ascendente", value=False)
+    top_n = st.number_input("Ver primeros N", min_value=50, max_value=5000, value=300, step=50)
 
-filtrado = resultado[resultado["Puntuación"] >= umbral].sort_values(by=orden, ascending=asc)
+filtrado = resultado[resultado["Puntuación"] >= umbral].sort_values(by=ordenar_por, ascending=asc)
 
 st.subheader(f"📋 Candidatos (puntuación ≥ {umbral})")
-cols_show = [c for c in ["nombre","Puntuación","matches","meses_totales","puestos_estables(>=12m)","puestos_muy_cortos(<3m)","_fuente_archivo"] if c in filtrado.columns]
-st.dataframe(filtrado[cols_show].head(200), use_container_width=True)
+cols_prefer = ["nombre","Puntuación","matches","meses_totales","puestos_estables(>=12m)","puestos_muy_cortos(<3m)","_fuente_archivo"]
+cols_show = [c for c in cols_prefer if c in filtrado.columns] + [c for c in filtrado.columns if c not in cols_prefer]
+st.dataframe(filtrado[cols_show].head(int(top_n)), use_container_width=True)
 
-# Descarga
+# ==========
+# Exportar
+# ==========
 csv_out = filtrado.to_csv(index=False).encode("utf-8")
 st.download_button("⬇️ Descargar CSV", csv_out, "candidatos_filtrados.csv", "text/csv")
 
-st.caption("La puntuación prioriza venta telefónica, telemarketing, fidelización y estabilidad laboral; penaliza rotación corta.")
+st.caption("El score prioriza CLOSERS: cierre, negociación, KPIs, venta consultiva, pipeline, B2B/alto valor; penaliza teleoperación y rotación corta.")
